@@ -1,0 +1,2 @@
+neural-amp-modeler==0.13.0
+# torch already on Colab — do not pin/reinstall unless CUDA mismatch

@@ -1,0 +1,45 @@
+{
+    "amplifier": "Vox Night Train 15W",
+    "controls": [
+        {
+            "id": "gain",
+            "label": "Gain",
+            "min": 2,
+            "max": 10,
+            "default": 6,
+            "model_min": 0.2,
+            "model_max": 1.0,
+            "capture_step": 0.2
+        },
+        {
+            "id": "treble",
+            "label": "Treble",
+            "min": 2,
+            "max": 10,
+            "default": 6,
+            "model_min": 0.2,
+            "model_max": 1.0,
+            "capture_step": 0.2
+        },
+        {
+            "id": "mid",
+            "label": "Middle",
+            "min": 2,
+            "max": 10,
+            "default": 6,
+            "model_min": 0.2,
+            "model_max": 1.0,
+            "capture_step": 0.2
+        },
+        {
+            "id": "bass",
+            "label": "Bass",
+            "min": 2,
+            "max": 10,
+            "default": 6,
+            "model_min": 0.2,
+            "model_max": 1.0,
+            "capture_step": 0.2
+        }
+    ]
+}
