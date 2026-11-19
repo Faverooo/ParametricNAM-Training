@@ -19,14 +19,17 @@ def stage_dataset(manifest: Path, destination: Path) -> None:
     if not input_wav.is_file() and input_name == Path("input_corto.wav"):
         # Captures from the Night Train exporter share this WAV across subsets.
         input_wav = root.parent / input_name
+    print(f"Copying reference audio: {input_wav}", flush=True)
     shutil.copyfile(input_wav, destination / "input.wav")
     document["x"] = "input.wav"
 
     for split in ("train", "test"):
-        entries = document.get(split)
+        entries = document.get(split) or []
         if not entries and split == "train":
             raise ValueError("Manifest needs at least one training take")
-        for index, entry in enumerate(entries or []):
+        if entries:
+            print(f"Copying {len(entries)} {split} takes from Drive to local storage.", flush=True)
+        for index, entry in enumerate(entries):
             source = root / entry["y"]
             relative = Path(split) / str(index) / source.name
             target = destination / relative
@@ -37,6 +40,9 @@ def stage_dataset(manifest: Path, destination: Path) -> None:
                 take_input = relative.with_name("input.wav" if source.name == "loopback.wav" else "loopback.wav")
                 shutil.copyfile(root / entry["x"], destination / take_input)
                 entry["x"] = take_input.as_posix()
+            copied = index + 1
+            if copied % 10 == 0 or copied == len(entries):
+                print(f"Copied {copied}/{len(entries)} {split} takes.", flush=True)
     (destination / "manifest.json").write_text(json.dumps(document, indent=2), encoding="utf-8")
 
 
@@ -60,6 +66,7 @@ def main():
     if min(args.steps, args.batch_size, args.val_every, args.checkpoint_every) < 1:
         parser.error("Step counts and batch size must be positive")
 
+    print("Loading training dependencies.", flush=True)
     from export_pnam import export, suggested_output_trim
     from nam_param.dataset import read_knob_names
 
@@ -71,13 +78,16 @@ def main():
         if [control["id"] for control in profile["controls"]] != read_knob_names(dataset):
             parser.error("Profile control IDs must match the dataset knob order")
 
+        audio_paths = sorted(dataset.rglob("*.wav"))
+        print(f"Verifying {len(audio_paths)} staged WAV files.", flush=True)
+        audio_sha256 = {
+            path.relative_to(dataset).as_posix(): file_sha256(path) for path in audio_paths
+        }
+        print("Audio verification complete.", flush=True)
         signature = {
             "preset": "nighttrain-s01-v1",
             "manifest_sha256": hashlib.sha256((dataset / "manifest.json").read_bytes()).hexdigest(),
-            "audio_sha256": {
-                path.relative_to(dataset).as_posix(): file_sha256(path)
-                for path in sorted(dataset.rglob("*.wav"))
-            },
+            "audio_sha256": audio_sha256,
             "batch_size": args.batch_size,
             "validation_interval": args.val_every,
         }
@@ -88,6 +98,7 @@ def main():
             parser.error("Use a new output directory for a run without run_config.json")
         run_config.write_text(json.dumps(signature, indent=2) + "\n", encoding="utf-8")
 
+        print(f"Starting training on {args.device} for {args.steps} total steps.", flush=True)
         trainer = Path(__file__).with_name("train_param.py")
         subprocess.run([
             sys.executable, str(trainer), "--dataset", str(dataset), "--out", str(args.out),
