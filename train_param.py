@@ -96,6 +96,8 @@ def parse_args(argv=None):
     p.add_argument("--log-every", type=int, default=50, help="Stampa loss/velocità ogni N step")
     p.add_argument("--progress-every", type=int, default=500,
                    help="Riscrive OUT/progress.txt ogni N step (anche a val, fine, errore)")
+    p.add_argument("--early-stop-steps", type=int, default=0,
+                   help="Stop after this many steps without a better validation score (0 disables)")
     p.add_argument("--val-every", type=int, default=500, help="Validate every N steps (step mode)")
     p.add_argument("--checkpoint-every", type=int, default=1000,
                    help="Write last.pt / train_state.pt every N steps")
@@ -521,6 +523,8 @@ def dataset_fingerprint(dataset_dir):
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.early_stop_steps < 0 or (args.early_stop_steps and args.steps is None):
+        raise ValueError("Early stopping requires step-based training and a nonnegative patience")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     prog = ProgressWriter(out / "progress.txt", run_name=out.name, total_steps=args.steps)
@@ -747,8 +751,9 @@ def _main(args, out, prog):
     best_step = None
     for h in history:
         sel = h.get("val_esr_floored") if h.get("val_esr_floored") is not None else h.get("val_esr")
-        if sel is not None and abs(sel - best_val) <= 1e-12 * max(1.0, abs(best_val)):
+        if sel is not None and sel == best_val:
             best_step = h["step"]
+            break
     last_h = history[-1] if history else {}
     prog.update(step=step, total=args.steps, best=(best_val if np.isfinite(best_val) else None), best_step=best_step,
                 val=last_h.get("val_esr"), val_floored=last_h.get("val_esr_floored"), val_step=last_h.get("step"))
@@ -810,6 +815,11 @@ def _main(args, out, prog):
             prog.write("RUNNING")
         return row
 
+    def patience_expired():
+        return args.early_stop_steps > 0 and best_step is not None and step - best_step >= args.early_stop_steps
+
+    stopped_early = False
+
     # ---- step-based training (preferred) ----
     if args.steps is not None:
         target_steps = int(args.steps)
@@ -820,7 +830,10 @@ def _main(args, out, prog):
         n_run = 0
         train_time = 0.0  # solo step di training (senza val/checkpoint) per la stima
         train_steps_timed = 0
-        while step < target_steps:
+        if step < target_steps and patience_expired():
+            maybe_validate_and_ckpt(force=True)
+            stopped_early = patience_expired()
+        while step < target_steps and not stopped_early:
             t_step = time.time()
             try:
                 batch = next(data_iter)
@@ -879,8 +892,12 @@ def _main(args, out, prog):
                             eta_h=(sec_per_step * (target_steps - step) + n_val_left * avg_val) / 3600.0
                             if train_steps_timed else None)
                 prog.write("RUNNING")
-            maybe_validate_and_ckpt()
+            maybe_validate_and_ckpt(force=patience_expired())
+            stopped_early = step < target_steps and patience_expired()
         maybe_validate_and_ckpt(force=True)
+        if stopped_early:
+            print(f"Early stop at step {step}: no better validation score in {step - best_step} steps "
+                  f"(best checkpoint at step {best_step}).")
 
     # ---- epoch-based (legacy) ----
     else:
@@ -935,6 +952,7 @@ def _main(args, out, prog):
             )
             if val_esr < best_val:
                 best_val = val_esr
+                best_step = step
                 model.export_parametric(out / "best.pt", metadata={"best_val_esr": best_val, "epoch": epoch})
             model.export_parametric(out / "last.pt", metadata={"epoch": epoch, "step": step})
             save_train_state(
@@ -1033,6 +1051,9 @@ def _main(args, out, prog):
         "test_out_of_trained_condition": fixed_g is not None,
         "total_seconds": total_time,
         "steps_this_run": steps_this_run,
+        "stopped_early": stopped_early,
+        "early_stop_steps": args.early_stop_steps,
+        "best_step": best_step,
         "steps": step,
         "device": device_label(device),
         "best_val_esr": best_val,

@@ -56,7 +56,9 @@ def main():
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--profile", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument("--steps", required=True, type=int, help="Total optimizer steps, including resumed steps")
+    parser.add_argument("--steps", default=60_000, type=int, help="Total optimizer steps, including resumed steps")
+    parser.add_argument("--early-stop-steps", default=30_000, type=int,
+                        help="Optimizer steps without a better validation score (0 disables)")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--scratch", type=Path, help="Local parent folder for staged WAV files")
     parser.add_argument("--batch-size", default=12, type=int)
@@ -65,6 +67,8 @@ def main():
     args = parser.parse_args()
     if min(args.steps, args.batch_size, args.val_every, args.checkpoint_every) < 1:
         parser.error("Step counts and batch size must be positive")
+    if args.early_stop_steps < 0:
+        parser.error("Early-stop steps must be nonnegative")
 
     print("Loading training dependencies.", flush=True)
     from export_pnam import export, suggested_output_trim
@@ -109,6 +113,7 @@ def main():
             "--pre-emph", "0.85", "--raw-weight", "1.0", "--mrstft-weight", "0.0005",
             "--energy-floor-db", "30", "--val-every", str(args.val_every),
             "--checkpoint-every", str(args.checkpoint_every),
+            "--early-stop-steps", str(args.early_stop_steps),
         ], check=True)
     report = json.loads((args.out / "report.json").read_text(encoding="utf-8"))
     trim = suggested_output_trim(report["validation_prediction_peak"])
