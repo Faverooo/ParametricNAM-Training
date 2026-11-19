@@ -15,7 +15,7 @@ def test_capture_inputs_survive_staging_and_pair_with_their_targets(tmp_path):
         "reference.wav": 0.1,
         "input-a.wav": 0.2,
         "input-b.wav": 0.3,
-        "target-a.wav": 0.4,
+        "loopback.wav": 0.4,
         "target-b.wav": 0.5,
     }.items():
         _write_wav_mono_f32_pcm24(source / filename, np.full(10000, amplitude, dtype=np.float32), 48000)
@@ -24,7 +24,7 @@ def test_capture_inputs_survive_staging_and_pair_with_their_targets(tmp_path):
         "x": "reference.wav",
         "sample_rate": 48000,
         "knob_names": ["gain"],
-        "train": [{"x": "input-a.wav", "y": "target-a.wav", "g": [0.2]}],
+        "train": [{"x": "input-a.wav", "y": "loopback.wav", "g": [0.2]}],
         "test": [{"x": "input-b.wav", "y": "target-b.wav", "g": [0.8]}],
     }))
 

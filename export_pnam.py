@@ -2,13 +2,23 @@
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import numpy as np
 import torch
 
 
-def export(checkpoint_path: Path, profile_path: Path, output_path: Path) -> None:
+def suggested_output_trim(peak: float, target_dbfs: float = -0.5) -> float:
+    if not math.isfinite(peak) or peak < 0 or not math.isfinite(target_dbfs) or target_dbfs > 0:
+        raise ValueError("Invalid peak or target level")
+    if peak < 0.001:
+        return 0.0
+    return max(-24.0, min(24.0, target_dbfs - 20.0 * math.log10(peak)))
+
+
+def export(checkpoint_path: Path, profile_path: Path, output_path: Path, *,
+           output_trim_db: float | None = None) -> None:
     numpy_scalars = [(np._core.multiarray.scalar, "numpy._core.multiarray.scalar"),
                      (np._core.multiarray.scalar, "numpy.core.multiarray.scalar"),
                      np.dtype, type(np.dtype("float32")), type(np.dtype("float64"))]
@@ -41,6 +51,10 @@ def export(checkpoint_path: Path, profile_path: Path, output_path: Path) -> None
         "base_nam": base,
         "film_linear": films,
     }
+    if output_trim_db is not None:
+        if not math.isfinite(output_trim_db) or not -24.0 <= output_trim_db <= 24.0:
+            raise ValueError("Output trim must be between -24 and 24 dB")
+        document["output_trim_db"] = output_trim_db
     output_path.write_text(
         json.dumps(document, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n",
         encoding="utf-8",
@@ -52,5 +66,6 @@ if __name__ == "__main__":
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("profile", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--output-trim-db", type=float)
     args = parser.parse_args()
-    export(args.checkpoint, args.profile, args.output)
+    export(args.checkpoint, args.profile, args.output, output_trim_db=args.output_trim_db)

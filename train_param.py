@@ -254,7 +254,7 @@ def evaluate_region_esr(model, x, y, g, device, start=0, stop=None, chunk_sample
         raise ValueError("Regione/chunk di valutazione non validi")
     ctx = model.receptive_field - 1
     g_t = torch.as_tensor(g, dtype=torch.float32).unsqueeze(0).to(device)
-    error_energy = signal_energy = 0.0
+    error_energy = signal_energy = prediction_peak = 0.0
     for pos in range(start, stop, chunk_samples):
         end = min(pos + chunk_samples, stop)
         left = max(0, pos - ctx)
@@ -268,9 +268,11 @@ def evaluate_region_esr(model, x, y, g, device, start=0, stop=None, chunk_sample
         target = target.double()
         error_energy += (pred - target).square().sum().item()
         signal_energy += target.square().sum().item()
+        if return_energies:
+            prediction_peak = max(prediction_peak, pred.abs().max().item())
     esr = error_energy / max(signal_energy, 1e-8)
     if return_energies:
-        return esr, error_energy, signal_energy
+        return esr, error_energy, signal_energy, prediction_peak
     return esr
 
 
@@ -291,7 +293,7 @@ def evaluate_per_file(model, ds_full, device, max_files=None, region="full", chu
     for i in range(n_files):
         y, g = ds_full.y_list[i], ds_full.g_list[i]
         x = ds_full.input_for(i) if hasattr(ds_full, "input_for") else ds_full.x_full
-        e, err_e, sig_e = evaluate_region_esr(model, x, y, g, device, start=start,
+        e, err_e, sig_e, prediction_peak = evaluate_region_esr(model, x, y, g, device, start=start,
                                               chunk_samples=chunk_samples, return_energies=True)
         n_samp = len(y) - start
         row = {
@@ -303,6 +305,7 @@ def evaluate_per_file(model, ds_full, device, max_files=None, region="full", chu
             "stop_sample": len(y),
             "num_samples": len(y) - start,
             "esr_val_region" if region == "val" else "esr_full": e,
+            "prediction_peak": prediction_peak,
             "signal_power_dbfs": 10.0 * np.log10(max(sig_e / max(n_samp, 1), 1e-30)),
         }
         if floor_power is not None:
@@ -965,22 +968,29 @@ def _main(args, out, prog):
     if center_esr is not None:
         print(f"Val ESR @ g={_fmt_g([0.5]*len(knob_names))}, classic NAM comparison: {center_esr:.6g}")
     # Carica i test SOLO ora: sono report finali, mai criteri di selezione.
-    test_full = ParametricNAMDataset(
-        args.dataset, split="full", entries="test", load_full=True,
-        receptive_field=rf, seed=args.seed,
-    )
-    print("Per-test-file ESR (whole file, zero padding only at file start):")
-    if fixed_g is not None:
-        print("  Baseline: fuori dalla condizione allenata, solo riferimento; non un test parametrico.")
-    per_file = evaluate_per_file(model, test_full, device, max_files=args.max_files_eval,
-                                 floor_power=val_floor_power)
-    for r in per_file:
-        print(f"  {r['file']}  g={_fmt_g(r['g'])}  ESR_full={r['esr_full']:.6g}")
-    mean_test = sum(r["esr_full"] for r in per_file) / max(len(per_file), 1)
-    print(f"Mean test ESR ({len(per_file)} file): {mean_test:.6g}")
+    per_file, zero_test = [], []
+    mean_test = None
+    if train_ds.manifest.get("test"):
+        test_full = ParametricNAMDataset(
+            args.dataset, split="full", entries="test", load_full=True,
+            receptive_field=rf, seed=args.seed,
+        )
+        print("Per-test-file ESR (whole file, zero padding only at file start):")
+        if fixed_g is not None:
+            print("  Baseline: fuori dalla condizione allenata, solo riferimento; non un test parametrico.")
+        per_file = evaluate_per_file(model, test_full, device, max_files=args.max_files_eval,
+                                     floor_power=val_floor_power)
+        for r in per_file:
+            print(f"  {r['file']}  g={_fmt_g(r['g'])}  ESR_full={r['esr_full']:.6g}")
+        if per_file:
+            mean_test = sum(r["esr_full"] for r in per_file) / len(per_file)
+            print(f"Mean test ESR ({len(per_file)} file): {mean_test:.6g}")
+
+        zero_test = evaluate_zero_input(model, test_full.g_list, device)
+    else:
+        print("No held-out takes. Reporting temporal validation only.")
 
     zero_train = evaluate_zero_input(model, train_ds.g_list, device)
-    zero_test = evaluate_zero_input(model, test_full.g_list, device)
     print("Zero-input DC (best checkpoint used for final eval), 5 condizioni con |DC| maggiore:")
     for r in sorted(zero_train + zero_test, key=lambda r: -abs(r["mean"]))[:5]:
         print(f"  g={_fmt_g(r['g'])} DC={r['mean']:.6g} RMS={r['rms_dbfs']:.2f} dBFS")
@@ -996,6 +1006,7 @@ def _main(args, out, prog):
     report = {
         "knob_names": knob_names,
         "mean_test_esr": mean_test,
+        "validation_prediction_peak": max(row["prediction_peak"] for row in val_rows),
         "mean_val_esr_floored": final_val_floored,
         "selection_metric": "floored_mean" if select_floored else "mean",
         "energy_floor_db": args.energy_floor_db,
@@ -1045,7 +1056,8 @@ def _main(args, out, prog):
     prog.update(step=step, eta_h=0.0, best=best_val, best_step=best_step)
     prog.write("FINISHED", f"val finale {final_val_esr:.6g}"
                + (f" (pavimento {final_val_floored:.6g})" if final_val_floored is not None else "")
-               + f", test medio {mean_test:.6g} su {len(per_file)} file. Esegui la cella report/.nam")
+               + (f", test medio {mean_test:.6g} su {len(per_file)} file" if mean_test is not None else "")
+               + ". Esegui la cella report/.nam")
     return report
 
 

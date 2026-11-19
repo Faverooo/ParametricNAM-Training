@@ -24,9 +24,9 @@ def stage_dataset(manifest: Path, destination: Path) -> None:
 
     for split in ("train", "test"):
         entries = document.get(split)
-        if not entries:
-            raise ValueError(f"Manifest needs a nonempty {split!r} split")
-        for index, entry in enumerate(entries):
+        if not entries and split == "train":
+            raise ValueError("Manifest needs at least one training take")
+        for index, entry in enumerate(entries or []):
             source = root / entry["y"]
             relative = Path(split) / str(index) / source.name
             target = destination / relative
@@ -34,7 +34,7 @@ def stage_dataset(manifest: Path, destination: Path) -> None:
             shutil.copyfile(source, target)
             entry["y"] = relative.as_posix()
             if "x" in entry:
-                take_input = relative.with_name("loopback.wav")
+                take_input = relative.with_name("input.wav" if source.name == "loopback.wav" else "loopback.wav")
                 shutil.copyfile(root / entry["x"], destination / take_input)
                 entry["x"] = take_input.as_posix()
     (destination / "manifest.json").write_text(json.dumps(document, indent=2), encoding="utf-8")
@@ -60,7 +60,7 @@ def main():
     if min(args.steps, args.batch_size, args.val_every, args.checkpoint_every) < 1:
         parser.error("Step counts and batch size must be positive")
 
-    from export_pnam import export
+    from export_pnam import export, suggested_output_trim
     from nam_param.dataset import read_knob_names
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -99,7 +99,10 @@ def main():
             "--energy-floor-db", "30", "--val-every", str(args.val_every),
             "--checkpoint-every", str(args.checkpoint_every),
         ], check=True)
-    export(args.out / "best.pt", args.profile, args.out / "model.pnam")
+    report = json.loads((args.out / "report.json").read_text(encoding="utf-8"))
+    trim = suggested_output_trim(report["validation_prediction_peak"])
+    export(args.out / "best.pt", args.profile, args.out / "model.pnam", output_trim_db=trim)
+    print(f"Exported model.pnam with default output trim {trim:+.1f} dB.")
 
 
 if __name__ == "__main__":

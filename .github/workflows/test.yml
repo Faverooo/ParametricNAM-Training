@@ -47,7 +47,7 @@ jobs:
           test -s "$RUNNER_TEMP/run/model.pnam"
       - name: Package notebook and trainer
         run: |
-          cmake -E tar cf ParametricNAM-Training.zip --format=zip ParametricNAM_Colab.ipynb README.md \
+          cmake -E tar cf ParametricNAM-Training.zip --format=zip ParametricNAM_Colab.ipynb README.md LICENSE \
             run_training.py train_param.py export_pnam.py requirements-colab.txt nam_param profiles
       - uses: actions/upload-artifact@v6
         with:
