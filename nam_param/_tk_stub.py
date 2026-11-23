@@ -3,7 +3,7 @@ import sys
 import types
 
 try:
-    import tkinter  # noqa: F401 — usarlo se disponibile, anche su una box headless
+    import tkinter  # noqa: F401 — use tkinter when installed, including on headless machines.
 except ModuleNotFoundError as exc:
     if exc.name not in ("tkinter", "_tkinter"):
         raise

@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
-"""
-Train a parametric A1 WaveNet on a ParametricNAM dataset (manifest.json).
+"""Train a parametric A1 WaveNet on a ParametricNAM dataset (manifest.json).
 
-N knob (2 per exp1-3, 4 per exp4: gain, treble, mid, bass): l'ordine di g viene
-da manifest['knob_names'] o dai nomi file (nam_param.dataset.infer_knob_names).
+The order of g comes from manifest['knob_names'] or from filenames via
+nam_param.dataset.infer_knob_names. Exp1–3 use two knobs, and exp4 uses
+four (gain, treble, mid, bass).
 
 Supports:
   - variants: none | shift_linear | shift_mlp | film_linear
-  - step-based training with LR exponential decay
-  - resume from last/best checkpoint (Colab disconnects)
-  - ESR + pre-emphasis (+ optional MRSTFT)
-  - balanced sampling across conditions / fixed-g subset for baseline
+  - step-based training with exponential learning rate decay
+  - resume from last or best checkpoint after a Colab interruption
+  - ESR and pre-emphasis, with optional MRSTFT
+  - balanced sampling across conditions or a fixed_g subset for the baseline
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import random
+import shutil
 import warnings
 import numpy as np
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -39,7 +42,7 @@ import nam_param._tk_stub  # noqa: F401
 from nam_param.device import resolve_device, device_label
 from nam_param.parametric_wavenet import build_a1_parametric, load_parametric
 from nam_param.variants import build_a1_parametric_variant
-from nam_param.dataset import ParametricNAMDataset, read_knob_names
+from nam_param.dataset import ParametricNAMDataset, read_knob_names, reference_audio_path
 from nam_param.losses_util import (mse_loss, esr_loss, esr_per_item, preemphasized_esr_mean,
                                    file_normalized_esr, file_train_energies, floor_file_energies,
                                    floor_file_energies_paired)
@@ -118,10 +121,10 @@ def parse_args(argv=None):
 
 
 class StatefulSegmentSampler(Sampler):
-    """Ordine riprendibile; ogni blocco balanced visita tutte le condizioni.
+    """Resumable sampler that visits every condition in each balanced block.
 
-    DataLoader shuffle=True globale bilanciava solo un'epoca intera. Qui anche
-    training interrotti a pochi step coprono le condizioni in modo bilanciato.
+    Globally shuffling the DataLoader only balances full epochs. Balanced blocks
+    also cover the conditions evenly when training stops after a few steps.
     """
     def __init__(self, ds, seed=0):
         self.ds = ds
@@ -210,7 +213,7 @@ def parse_g(s: Optional[str]):
 
 @torch.no_grad()
 def evaluate(model, loader, device):
-    """Valutazione di crop con pre-roll: ogni elemento pesa uguale nel risultato."""
+    """Evaluate crops with pre-roll and equal weight per item."""
     was_training = model.training
     model.eval()
     esrs = []
@@ -244,11 +247,11 @@ def validation_view(train_ds):
 @torch.no_grad()
 def evaluate_region_esr(model, x, y, g, device, start=0, stop=None, chunk_samples=48000,
                         return_energies=False):
-    """ESR globale della regione, non media degli ESR dei chunk.
+    """Compute ESR over the whole region using signal and error energies.
 
-    Ogni chunk usa RF-1 campioni reali di pre-roll; solo l'inizio del file
-    usa padding causale a zero. Nessun campione viene scartato o contato due volte.
-    Il chunking limita la memoria anche sui test interi (~190 s).
+    Each chunk uses RF-1 real pre-roll samples. Causal zero padding is used at
+    the start of the file. Each target sample contributes exactly once.
+    Chunking bounds memory use for long test recordings.
     """
     model.eval()
     stop = len(y) if stop is None else stop
@@ -265,7 +268,7 @@ def evaluate_region_esr(model, x, y, g, device, start=0, stop=None, chunk_sample
         target = torch.as_tensor(y[pos:end]).unsqueeze(0)
         if pred.shape != target.shape:
             raise RuntimeError(f"Eval alignment: {pred.shape} != {target.shape}")
-        # Accumulo in float64 su CPU (compatibile anche con DirectML).
+        # Accumulate in float64 on the CPU for DirectML compatibility.
         pred = pred.cpu().double()
         target = target.double()
         error_energy += (pred - target).square().sum().item()
@@ -281,10 +284,10 @@ def evaluate_region_esr(model, x, y, g, device, start=0, stop=None, chunk_sample
 @torch.no_grad()
 def evaluate_per_file(model, ds_full, device, max_files=None, region="full", chunk_samples=48000,
                       floor_power=None):
-    """Un ESR per condizione: val dei TRAIN oppure file TEST intero.
+    """Compute one ESR per condition over the training validation region or full test file.
 
-    Il test include tutti i campioni, anche blip/silenzi iniziali: condizioni
-    interamente mai viste; padding iniziale e pre-roll sono gestiti dal helper.
+    Held-out tests include all samples, including initial transients and silence.
+    The region helper handles padding and pre-roll.
     """
     if region not in ("val", "full"):
         raise ValueError(region)
@@ -311,8 +314,8 @@ def evaluate_per_file(model, ds_full, device, max_files=None, region="full", chu
             "signal_power_dbfs": 10.0 * np.log10(max(sig_e / max(n_samp, 1), 1e-30)),
         }
         if floor_power is not None:
-            # Stesso pavimento della loss v4 (potenza raw per campione): un file quasi
-            # muto non domina la media né la scelta di best.pt.
+            # Use the same per-sample raw power floor as the v4 loss so nearly silent files
+            # cannot dominate the mean or determine the best checkpoint by themselves.
             row["esr_floored"] = err_e / max(sig_e, floor_power * n_samp, 1e-8)
             row["floored"] = sig_e < floor_power * n_samp
         results.append(row)
@@ -329,7 +332,7 @@ def mean_validation_esr(model, val_ds, device, floor_power=None):
 
 
 def floored_mean(rows, key="esr_val_region"):
-    """Media della ESR con pavimento (se presente), altrimenti media normale."""
+    """Average the floored ESR if available, or the raw ESR otherwise."""
     vals = [r.get("esr_floored", r[key]) for r in rows]
     value = sum(vals) / len(vals)
     if not np.isfinite(value):
@@ -359,6 +362,12 @@ def write_rows_csv(path, rows, knob_names, key):
                         int(bool(r.get("floored", False))), f"{r.get('signal_power_dbfs', float('nan')):.2f}"])
 
 
+def copy_checkpoint(source: Path, destination: Path):
+    temporary = destination.with_name(destination.name + ".tmp")
+    shutil.copyfile(source, temporary)
+    temporary.replace(destination)
+
+
 def save_train_state(path: Path, model, opt, sched, step, epoch, best_val, args_dict, history, rng_state=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     # Model weights via export_parametric side file + full train state
@@ -384,11 +393,11 @@ def save_train_state(path: Path, model, opt, sched, step, epoch, best_val, args_
     }
     tmp = path.with_name(path.name + ".tmp")
     torch.save(payload, tmp)
-    # Copia di riserva del checkpoint precedente: se Colab muore mentre Drive
-    # sincronizza il file nuovo, il resume usa train_state.prev.pt.
+    # Keep the previous checkpoint as a backup in case Colab stops while Drive
+    # syncs the new file. Resume can then use train_state.prev.pt.
     prev = previous_state_path(path)
     if path.exists():
-        path.replace(prev)
+        copy_checkpoint(path, prev)
     tmp.replace(path)
 
 
@@ -396,8 +405,12 @@ def previous_state_path(path: Path) -> Path:
     return path.with_name(path.stem + ".prev" + path.suffix)
 
 
-def load_train_state(path: Path, device):
-    """Carica train_state.pt; se è troncato/corrotto prova train_state.prev.pt."""
+def train_state_exists(path: Path) -> bool:
+    return path.is_file() or previous_state_path(path).is_file()
+
+
+def load_train_state(path: Path, device, *, with_source=False):
+    """Load the requested checkpoint or its backup, optionally with its source path."""
     path = Path(path)
     errors = []
     for cand in (path, previous_state_path(path)):
@@ -408,21 +421,22 @@ def load_train_state(path: Path, device):
             if not isinstance(state, dict) or "model_state_dict" not in state:
                 raise ValueError("contenuto non valido")
             if cand != path:
-                warnings.warn(f"{path.name} illeggibile ({errors[-1] if errors else '?'}): riprendo da {cand.name}")
-                print(f"ATTENZIONE: {path.name} illeggibile, riprendo dal checkpoint precedente {cand.name}")
-            return state
-        except Exception as e:  # file troncato da una disconnessione
+                reason = errors[-1] if errors else "file assente"
+                warnings.warn(f"{reason}: riprendo da {cand.name}")
+                print(f"ATTENZIONE: {reason}, riprendo dal checkpoint precedente {cand.name}")
+            return (state, cand) if with_source else state
+        except Exception as e:  # The file may be truncated after an interruption.
             errors.append(f"{cand.name}: {e}")
     raise RuntimeError("Nessun train_state leggibile: " + "; ".join(errors))
 
 
-# Versione della definizione di loss salvata nei checkpoint: la v1 (ESR per crop)
-# non va ripresa con la v2, sono obiettivi diversi.
+# Checkpoints record the loss definition. V1 uses per-crop ESR
+# and is incompatible with the V2 objective.
 LOSS_DEF = "v2_file_normalized_esr"  # legacy API/default retained
 LOSS_DEF_V3 = "v3_dual_file_normalized_esr"
 LOSS_DEF_DC = "v3_dc_file_normalized_esr"
-# v4 = v3 dual + pavimento del normalizzatore per file (exp4). Un train_state v3
-# NON viene ripreso con v4; i soli pesi (--init-parametric) sì.
+# V4 adds a per-file normalization floor to the V3 dual loss.
+# Use --init-parametric to import V3 weights into a new V4 run.
 LOSS_DEF_V4 = "v4_dual_floored_file_normalized_esr"
 
 
@@ -517,12 +531,29 @@ def compute_batch_loss(pred, y, pre_emph, loss_kind, mrstft_weight, mrstft_mod, 
 
 
 def dataset_fingerprint(dataset_dir):
-    import hashlib
     return hashlib.sha256((Path(dataset_dir) / "manifest.json").read_bytes()).hexdigest()
+
+
+def audio_fingerprint(dataset_dir, manifest):
+    root = Path(dataset_dir)
+    names = set()
+    for split in ("train", "test"):
+        for entry in manifest.get(split) or []:
+            names.add(entry["y"])
+            if "x" in entry:
+                names.add(entry["x"])
+    fingerprint = hashlib.sha256()
+    paths = [reference_audio_path(root, manifest), *(root / name for name in sorted(names))]
+    for path in paths:
+        with path.open("rb") as file:
+            fingerprint.update(hashlib.file_digest(file, "sha256").digest())
+    return fingerprint.hexdigest()
 
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.steps is None and args.epochs is None:
+        args.steps = 50000
     if args.early_stop_steps < 0 or (args.early_stop_steps and args.steps is None):
         raise ValueError("Early stopping requires step-based training and a nonnegative patience")
     out = Path(args.out)
@@ -546,13 +577,20 @@ def _main(args, out, prog):
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    if args.steps is None and args.epochs is None:
-        args.steps = 50000  # sensible Colab default for long runs
     balanced = not args.no_balanced
     if not np.isfinite(args.grad_clip) or args.grad_clip < 0:
         raise ValueError("grad_clip must be finite and nonnegative")
     if args.init_from and args.init_parametric:
         raise ValueError("choose --init-from OR --init-parametric")
+    resume_path = None
+    if args.resume:
+        resume_path = Path(args.resume)
+        if resume_path.is_dir():
+            resume_path = resume_path / "train_state.pt"
+        if not train_state_exists(resume_path):
+            raise FileNotFoundError(resume_path)
+    elif not args.no_auto_resume and train_state_exists(out / "train_state.pt"):
+        resume_path = out / "train_state.pt"
     if args.loss == "esr_dual" and (not np.isfinite(args.raw_weight) or args.raw_weight <= 0):
         raise ValueError("raw_weight must be finite and positive")
     if args.loss == "esr_dc" and (not np.isfinite(args.dc_weight) or args.dc_weight <= 0):
@@ -560,7 +598,7 @@ def _main(args, out, prog):
     fixed_g = parse_g(args.fixed_g)
     if args.energy_floor_db is not None and not (0 < args.energy_floor_db < 200):
         raise ValueError("--energy-floor-db must be in (0, 200)")
-    loss_definition(args.loss, args.energy_floor_db)  # valida subito la combinazione
+    loss_definition(args.loss, args.energy_floor_db)  # Validate the combination before training.
     knob_names = read_knob_names(args.dataset)
     if args.knob_names:
         wanted = [k.strip().lower() for k in args.knob_names.split(",")]
@@ -580,17 +618,17 @@ def _main(args, out, prog):
 
     model = build_model(args, knob_names)
     warm_info = None
-    if args.init_from:
+    if args.init_from and resume_path is None:
         print(f"Warm-start from {args.init_from}")
-        model.load_stock_nam_weights(args.init_from)  # mismatch deve fermare, non essere ignorato
-    if args.init_parametric:
+        model.load_stock_nam_weights(args.init_from)  # Fail on a weight mismatch.
+    if args.init_parametric and resume_path is None:
         source = load_parametric(args.init_parametric)
         if getattr(source, "variant", "shift_linear") != args.variant:
             raise ValueError("parametric warm-start variant mismatch")
         if list(source.knob_names) == list(model.knob_names):
             model.load_state_dict(source.state_dict(), strict=True)
         else:
-            # es. exp3 [gain,treble] -> exp4 [gain,treble,mid,bass]: colonne nuove = 0
+            # For example, new mid and bass columns start at zero when expanding exp3 to exp4.
             warm_info = expand_knob_warm_start(model, source)
             print(f"Warm-start ESPANSO {warm_info['source_knobs']} -> {warm_info['target_knobs']}: "
                   f"{len(warm_info['expanded'])} matrici FiLM con colonne nuove {warm_info['new_knobs']} a zero")
@@ -610,8 +648,8 @@ def _main(args, out, prog):
         fixed_g=fixed_g,
         return_file_index=True,
     )
-    # Denominatore della loss v2: energia (pre-enfatizzata come la loss) di
-    # tutta la regione train di ciascun file, calcolata una volta sola.
+    # The V2 denominator is each file's full training-region energy.
+    # Compute it once with the same pre-emphasis as the loss.
     pre_emph = None if args.no_pre_emph else args.pre_emph
     file_energy_table = file_train_energies(
         train_ds.y_list, train_ds.region_start, train_ds.region_stop, pre_emph
@@ -619,12 +657,12 @@ def _main(args, out, prog):
     raw_file_energy_table = (file_train_energies(
         train_ds.y_list, train_ds.region_start, train_ds.region_stop, None
     ).to(device) if args.loss in ("esr_dual", "esr_dc") else None)
-    # Nessun accesso ai test durante la selezione di best.pt.
-    # Una passata deterministica copre TUTTA la val di OGNI condizione train
-    # (solo fixed_g per la baseline), con peso uguale per condizione.
+    # Keep held-out tests out of best checkpoint selection.
+    # A deterministic pass covers the full validation region of each training condition,
+    # with equal weight per condition and only fixed_g for the baseline.
     raw_floor, floored_idx = None, []
     if args.energy_floor_db is not None:
-        # v4: solo con esr_dual (validato sopra), quindi la tabella raw esiste.
+        # V4 requires esr_dual, so the raw energy table is available.
         raw_file_energy_table, file_energy_table, raw_floor, floored_idx = floor_file_energies_paired(
             raw_file_energy_table, file_energy_table, args.energy_floor_db)
         names = [train_ds.entries[i]["y"] for i in floored_idx]
@@ -662,16 +700,18 @@ def _main(args, out, prog):
     mrstft_mod = None
     if args.mrstft_weight and args.mrstft_weight > 0:
         from nam._dependencies.auraloss.freq import MultiResolutionSTFTLoss
-        # DirectML può non implementare STFT: autograd attraversa il trasferimento CPU.
+        # DirectML can lack STFT support. Autograd works across the CPU transfer.
         mrstft_device = torch.device("cpu") if "privateuseone" in str(device) else device
         mrstft_mod = MultiResolutionSTFTLoss().to(mrstft_device)
 
     args_dict = vars(args).copy()
+    args_dict["run_id"] = uuid.uuid4().hex
     args_dict["channels"] = list(channels_tuple) if channels_tuple else None
     args_dict["loss_def"] = loss_definition(args.loss, args.energy_floor_db)
     args_dict["knob_names_resolved"] = knob_names
-    # Il percorso del dataset può cambiare fra sessioni (es. /content diverso): conta il contenuto.
+    # Compare dataset contents because the path can change between sessions.
     args_dict["dataset_fingerprint"] = dataset_fingerprint(args.dataset)
+    args_dict["audio_fingerprint"] = audio_fingerprint(args.dataset, train_ds.manifest)
     args_dict["warm_start_info"] = warm_info
     select_floored = args.energy_floor_db is not None
     val_floor_power = raw_floor if select_floored else None
@@ -690,32 +730,31 @@ def _main(args, out, prog):
     t0 = time.time()
 
     # Resume
-    resume_path = None
-    if args.resume:
-        resume_path = Path(args.resume)
-        if resume_path.is_dir():
-            resume_path = resume_path / "train_state.pt"
-    elif not args.no_auto_resume:
-        cand = out / "train_state.pt"
-        if cand.exists():
-            resume_path = cand
-    if args.resume and not resume_path.exists():
-        raise FileNotFoundError(resume_path)
-    if resume_path is not None and resume_path.exists():
+    resume_in_place = False
+    checkpoint_current = False
+    best_step = None
+    if resume_path is not None:
+        resume_in_place = resume_path.parent.resolve() == out.resolve()
+        checkpoint_current = resume_in_place and resume_path.name == "train_state.pt"
         print(f"Resuming from {resume_path}")
-        state = load_train_state(resume_path, device)
+        state, loaded_state_path = load_train_state(resume_path, device, with_source=True)
         old = state.get("args", {})
+        prior_run_id = old.get("run_id")
+        if prior_run_id is not None:
+            args_dict["run_id"] = prior_run_id
         if old.get("loss_def") != args_dict["loss_def"]:
             raise ValueError(
                 f"Checkpoint {resume_path} usa la loss {old.get('loss_def', 'v1 (ESR per crop)')}, "
                 f"non {args_dict['loss_def']}: non riprenderlo, usa una cartella --out nuova (o cancella la vecchia)."
             )
+        if old.get("dataset_fingerprint", args_dict["dataset_fingerprint"]) != args_dict["dataset_fingerprint"]:
+            raise ValueError(f"Resume incompatible option dataset: manifest diverso ({old.get('dataset')} -> {args.dataset})")
+        if old.get("audio_fingerprint", args_dict["audio_fingerprint"]) != args_dict["audio_fingerprint"]:
+            raise ValueError("Resume incompatible option dataset: WAV content changed")
         if old.get("dataset") != args_dict["dataset"]:
-            if old.get("dataset_fingerprint", args_dict["dataset_fingerprint"]) != args_dict["dataset_fingerprint"]:
-                raise ValueError(f"Resume incompatible option dataset: manifest diverso ({old.get('dataset')} != {args.dataset})")
             print(f"  dataset in un percorso nuovo ({args.dataset}), stesso manifest: ok")
-        # Il warm-start avviene solo al primo avvio: in ripresa conserva da dove era partito il run.
-        if not args.init_parametric and old.get("init_parametric"):
+        # Keep the original warm-start information when resuming a run.
+        if old.get("init_parametric"):
             args.init_parametric = old["init_parametric"]
             args_dict["init_parametric"] = old["init_parametric"]
             warm_info = old.get("warm_start_info")
@@ -741,29 +780,64 @@ def _main(args, out, prog):
         epoch = int(state.get("epoch", 0))
         best_val = float(state.get("best_val", best_val))
         history = list(state.get("history", []))
+        source_best = resume_path.with_name("best.pt")
+        best_matches_run = False
+        if source_best.is_file():
+            payload = torch.load(source_best, map_location="cpu", weights_only=False)
+            metadata = payload.get("config", {}).get("metadata", {})
+            del payload
+            saved_score = metadata.get("best_val_esr", best_val)
+            saved_run_id = metadata.get("run_id")
+            best_matches_run = saved_run_id == prior_run_id or (
+                saved_run_id is None and np.isfinite(best_val) and saved_score == best_val
+            )
+            if best_matches_run and (not np.isfinite(saved_score) or saved_score > best_val):
+                raise ValueError(f"{source_best} does not match the best score in the training checkpoint")
+            if best_matches_run:
+                checkpoint_current = checkpoint_current and saved_score == best_val
+                best_val = saved_score
+                best_step = metadata.get("step")
+        if np.isfinite(best_val):
+            if not best_matches_run:
+                raise ValueError(f"Resume requires the matching best model at {source_best}")
+            if not resume_in_place:
+                for source in (source_best.with_suffix(".json"), source_best):
+                    if source.is_file():
+                        copy_checkpoint(source, out / source.name)
         if state.get("rng_state"):
             restore_rng_state(state["rng_state"], train_ds, sampler, loader_generator)
         else:
             warnings.warn("Legacy checkpoint lacks RNG/sampler state: resume is not exact")
+        if resume_in_place and resume_path.name == "train_state.pt" and loaded_state_path != resume_path:
+            copy_checkpoint(loaded_state_path, resume_path)
         print(f"  resumed at step={step} epoch={epoch} best_val={best_val:.6g}")
 
     start_step = step
-    best_step = None
-    for h in history:
-        sel = h.get("val_esr_floored") if h.get("val_esr_floored") is not None else h.get("val_esr")
-        if sel is not None and sel == best_val:
-            best_step = h["step"]
-            break
+    if best_step is None:
+        for h in history:
+            sel = h.get("val_esr_floored") if h.get("val_esr_floored") is not None else h.get("val_esr")
+            if sel is not None and sel == best_val:
+                best_step = h["step"]
+                break
     last_h = history[-1] if history else {}
     prog.update(step=step, total=args.steps, best=(best_val if np.isfinite(best_val) else None), best_step=best_step,
                 val=last_h.get("val_esr"), val_floored=last_h.get("val_esr_floored"), val_step=last_h.get("step"))
     prog.write("RUNNING", "ripreso dal checkpoint" if step > 0 else "primo avvio")
     val_seconds_total, val_count = 0.0, 0
     last_val_step = history[-1].get("step", -1) if history else -1
-    last_ckpt_step = step if resume_path is not None and resume_path.exists() else -1
+    last_ckpt_step = step if checkpoint_current else -1
+
+    def write_checkpoint():
+        nonlocal last_ckpt_step
+        model.export_parametric(out / "last.pt", metadata={"step": step, "epoch": epoch})
+        save_train_state(
+            out / "train_state.pt", model, opt, sched, step, epoch, best_val, args_dict, history,
+            capture_rng_state(train_ds, sampler, loader_generator)
+        )
+        last_ckpt_step = step
 
     def maybe_validate_and_ckpt(force=False):
-        nonlocal best_val, last_val_step, last_ckpt_step, best_step, val_seconds_total, val_count
+        nonlocal best_val, last_val_step, best_step, val_seconds_total, val_count
         do_val = (force or step % args.val_every == 0) and step > 0 and step != last_val_step
         do_ckpt = (force or step % args.checkpoint_every == 0) and step > 0 and (step != last_ckpt_step or do_val)
         row = None
@@ -782,7 +856,7 @@ def _main(args, out, prog):
                 "val_esr_median": float(np.median([r["esr_val_region"] for r in validation_rows])),
                 "lr": sched.get_last_lr()[0],
             }
-            val_seconds = time.time() - t_val  # non in history: il resume esatto la confronta
+            val_seconds = time.time() - t_val  # Omit timing from history so resumed runs can compare it exactly.
             val_seconds_total += val_seconds
             val_count += 1
             summary, summary_text = compact_validation_summary(validation_rows)
@@ -798,16 +872,12 @@ def _main(args, out, prog):
                 best_step = step
                 model.export_parametric(out / "best.pt", metadata={
                     "best_val_esr": best_val, "step": step, "val_esr_raw_mean": val_esr,
+                    "run_id": args_dict["run_id"],
                     "selection_metric": "floored_mean" if select_floored else "mean",
                     "loss_def": args_dict["loss_def"], "knob_names": knob_names})
                 print(f"  saved best -> {out / 'best.pt'}")
         if do_ckpt:
-            model.export_parametric(out / "last.pt", metadata={"step": step, "epoch": epoch})
-            save_train_state(
-                out / "train_state.pt", model, opt, sched, step, epoch, best_val, args_dict, history,
-                capture_rng_state(train_ds, sampler, loader_generator)
-            )
-            last_ckpt_step = step
+            write_checkpoint()
             print(f"  checkpoint -> {out / 'train_state.pt'}")
         if row is not None:
             prog.update(step=step, val=row["val_esr"], val_floored=row["val_esr_floored"], val_step=step,
@@ -828,7 +898,7 @@ def _main(args, out, prog):
         last_log = time.time()
         running = 0.0
         n_run = 0
-        train_time = 0.0  # solo step di training (senza val/checkpoint) per la stima
+        train_time = 0.0  # Use training step time for the estimate.
         train_steps_timed = 0
         if step < target_steps and patience_expired():
             maybe_validate_and_ckpt(force=True)
@@ -863,7 +933,7 @@ def _main(args, out, prog):
             n_run += 1
             if step % args.lr_step_every == 0:
                 sched.step()
-            if step - start_step > 3:  # salta i primi step (cudnn benchmark / warmup)
+            if step - start_step > 3:  # Skip the initial cuDNN benchmark and warmup steps.
                 train_time += time.time() - t_step
                 train_steps_timed += 1
             if step % args.log_every == 0:
@@ -932,12 +1002,14 @@ def _main(args, out, prog):
             avg_loss = epoch_loss / max(n_batches, 1)
             elapsed = time.time() - t_epoch
             steps_per_s = n_batches / max(elapsed, 1e-9)
-            val_esr, validation_rows = mean_validation_esr(model, val_ds, device)
+            val_esr, validation_rows = mean_validation_esr(model, val_ds, device, floor_power=val_floor_power)
+            val_sel = floored_mean(validation_rows) if select_floored else val_esr
             row = {
                 "epoch": epoch,
                 "step": step,
                 "train_loss": avg_loss,
                 "val_esr": val_esr,
+                "val_esr_floored": val_sel if select_floored else None,
                 "steps_per_s": steps_per_s,
                 "lr": sched.get_last_lr()[0],
             }
@@ -950,15 +1022,15 @@ def _main(args, out, prog):
                 f"epoch {epoch:4d}  loss={avg_loss:.6g}  val_ESR={val_esr:.6g}  "
                 f"{steps_per_s:.2f} steps/s  lr={row['lr']:.6g}"
             )
-            if val_esr < best_val:
-                best_val = val_esr
+            if val_sel < best_val:
+                best_val = val_sel
                 best_step = step
-                model.export_parametric(out / "best.pt", metadata={"best_val_esr": best_val, "epoch": epoch})
-            model.export_parametric(out / "last.pt", metadata={"epoch": epoch, "step": step})
-            save_train_state(
-                out / "train_state.pt", model, opt, sched, step, epoch, best_val, args_dict, history,
-                capture_rng_state(train_ds, sampler, loader_generator)
-            )
+                model.export_parametric(out / "best.pt", metadata={
+                    "best_val_esr": best_val, "epoch": epoch, "step": step, "run_id": args_dict["run_id"],
+                })
+            write_checkpoint()
+        if step > 0 and step != last_ckpt_step:
+            write_checkpoint()
 
     total_time = time.time() - t0
     prog.update(step=step, eta_h=0.0)
@@ -968,12 +1040,9 @@ def _main(args, out, prog):
 
     # Prefer best weights for final eval if present
     best_pt = out / "best.pt"
-    if best_pt.exists():
-        try:
-            model = load_parametric(best_pt).to(device)
-            print(f"  (loaded best.pt for eval)")
-        except Exception as e:
-            print(f"  (keep last weights; best load failed: {e})")
+    if np.isfinite(best_val):
+        model = load_parametric(best_pt).to(device)
+        print("  (loaded best.pt for eval)")
     final_val_esr, val_rows = mean_validation_esr(model, val_ds, device, floor_power=val_floor_power)
     final_val_floored = floored_mean(val_rows) if select_floored else None
     center_rows = [r for r in val_rows if len(r["g"]) == len(knob_names)
@@ -985,7 +1054,7 @@ def _main(args, out, prog):
     print(f"Final median val ESR: {float(np.median([r['esr_val_region'] for r in val_rows])):.6g}")
     if center_esr is not None:
         print(f"Val ESR @ g={_fmt_g([0.5]*len(knob_names))}, classic NAM comparison: {center_esr:.6g}")
-    # Carica i test SOLO ora: sono report finali, mai criteri di selezione.
+    # Load held-out tests after model selection for the final report.
     per_file, zero_test = [], []
     mean_test = None
     if train_ds.manifest.get("test"):

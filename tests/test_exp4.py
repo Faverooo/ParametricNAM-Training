@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Test exp4 (4 knob): nomi file, sampler bilanciato su 81 condizioni, pavimento
-del normalizzatore, warm-start espanso exp3 -> exp4, resume v3/v4, controlli Colab.
+"""Test the four-knob dataset, balanced sampling, the loss denominator floor,
+warm-start expansion, checkpoint resume, and Colab preflight checks.
 
-Gira su CPU in ~1-2 minuti. Uso: python tests/test_exp4.py
+Run with python tests/test_exp4.py. The tests take about one to two minutes on CPU.
 """
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ _DS = None
 
 
 def synthetic_ds():
-    """81+8 file da 1 s, stessa struttura di dataset_4knob (creato una volta)."""
+    """Generate 81 training and eight test files once, using the dataset_4knob layout."""
     global _DS
     if _DS is None:
         _DS = _TMP / "dataset_4knob"
@@ -69,13 +69,13 @@ def test_name_parsing():
             raise AssertionError(bad)
     m = json.loads((synthetic_ds() / "manifest.json").read_text())
     assert "knob_names" not in m and infer_knob_names(m) == ["gain", "treble", "mid", "bass"]
-    # manifest reale (se presente sulla box), mai su Colab
+    # Check the real manifest if available on the local machine.
     real = Path("/workspace/real4/manifest.json")
     if real.exists():
         rm = json.loads(real.read_text())
         assert infer_knob_names(rm) == ["gain", "treble", "mid", "bass"]
         assert len(rm["train"]) == 81 and len(rm["test"]) == 8
-    # g che non corrisponde al nome -> errore
+    # Reject g values that disagree with the filename.
     bad = json.loads(json.dumps(m))
     bad["train"][5]["g"] = [0.0, 0.0, 0.0, 0.0] if bad["train"][5]["g"] != [0.0] * 4 else [1.0] * 4
     try:
@@ -84,7 +84,7 @@ def test_name_parsing():
         assert "non corrisponde" in str(e)
     else:
         raise AssertionError("g/name mismatch not detected")
-    # ordine dei knob diverso fra file -> errore
+    # Reject inconsistent knob ordering across files.
     bad = json.loads(json.dumps(m))
     bad["test"][0]["y"] = "test/treble0.25_gain0.25_mid0.25_bass0.25.wav"
     try:
@@ -93,7 +93,7 @@ def test_name_parsing():
         assert "incoerente" in str(e)
     else:
         raise AssertionError("order mismatch not detected")
-    # legacy 2 knob del pacchetto
+    # Legacy two-knob dataset.
     legacy = json.loads((legacy_dataset() / "manifest.json").read_text())
     assert infer_knob_names(legacy) == ["gain", "treble"]
     ds = quiet(ParametricNAMDataset, synthetic_ds(), segment_samples=1000, receptive_field=4093)
@@ -112,9 +112,9 @@ def test_sampler_balance_81():
     files = [ds[i][3] for i in order]
     counts = Counter(files)
     assert set(counts) == set(range(81)) and len(set(counts.values())) == 1, counts
-    for b in range(0, len(files), n):  # ogni blocco di 81 = tutte le condizioni una volta
+    for b in range(0, len(files), n):  # Each block of 81 covers every condition once.
         assert sorted(files[b:b + n]) == list(range(81))
-    # batch reale da 12 sul DataLoader: su 27 batch (=4 blocchi) ogni condizione 4 volte
+    # With a DataLoader batch size of 12, 27 batches cover each condition four times.
     sampler2 = train_param.StatefulSegmentSampler(ds, seed=7)
     loader = torch.utils.data.DataLoader(ds, batch_size=12, sampler=sampler2)
     seen = Counter()
@@ -122,10 +122,10 @@ def test_sampler_balance_81():
     for _ in range(27):
         seen.update(next(it)[3].tolist())
     assert set(seen.values()) == {4}, seen
-    # g del crop = g del file
+    # The crop must have the same g values as its source file.
     x, y, g, fi = ds[order[0]]
     assert torch.allclose(g, torch.from_numpy(ds.g_list[fi]))
-    # resume del sampler: stessa sequenza
+    # Resuming the sampler must preserve the sequence.
     s3 = train_param.StatefulSegmentSampler(ds, seed=11)
     it3 = iter(s3)
     first = [next(it3) for _ in range(40)]
@@ -138,12 +138,12 @@ def test_sampler_balance_81():
 
 
 def test_normalizer_floor():
-    # tabella realistica: mediana -30 dB, un file a -89 dB, uno a -67 dB, uno a -54 dB
+    # Energy table with median -30 dB and files at -89, -67, and -54 dB.
     db = [-89.0, -67.0, -54.0] + [-30.0] * 10 + [-20.0] * 5
     table = torch.tensor([10 ** (d / 10) for d in db], dtype=torch.float32)
     out, floor, idx = floor_file_energies(table, 30.0)
     assert math.isclose(10 * math.log10(floor), -60.0, abs_tol=1e-4), floor
-    assert idx == [0, 1], idx  # -54 dB NON pavimentato
+    assert idx == [0, 1], idx  # The -54 dB file stays above the floor.
     assert torch.allclose(out[2:], table[2:]) and torch.allclose(out[:2], torch.full((2,), floor))
     same, f0, i0 = floor_file_energies(table, None)
     assert same is table and f0 is None and i0 == []
@@ -154,7 +154,7 @@ def test_normalizer_floor():
             pass
         else:
             raise AssertionError(bad)
-    # effetto sulla loss: offset DC a -70 dBFS sul file quasi muto
+    # Loss with a -70 dBFS DC offset in a nearly silent file.
     T = 4800
     y = torch.zeros(2, T)
     y[0] = 10 ** (-89 / 20) * torch.randn(T)
@@ -163,16 +163,16 @@ def test_normalizer_floor():
     e_pre = file_train_energies([y[0].numpy(), y[1].numpy()], 0, T, 0.85)
     e_raw = file_train_energies([y[0].numpy(), y[1].numpy()], 0, T, None)
     l3 = train_param.compute_batch_loss(pred, y, 0.85, "esr_dual", 0, None, e_pre, e_raw)
-    # tabella di 11 file: i 2 del batch + 9 a -30 dB (mediana -30 dB -> pavimento -60 dB)
+    # Eleven files: two in the batch and nine at -30 dB, giving a floor of -60 dB.
     raw11 = torch.cat([e_raw, torch.full((9,), 1e-3)])
     pre11 = torch.cat([e_pre, torch.full((9,), 4e-4)])
     rawf, pref, raw_floor, fidx = floor_file_energies_paired(raw11, pre11, 30.0)
     assert fidx == [0] and math.isclose(10 * math.log10(raw_floor), -60.0, abs_tol=1e-3)
-    assert torch.allclose(pref[0] / rawf[0], pre11[0] / raw11[0])  # spettro del file conservato
+    assert torch.allclose(pref[0] / rawf[0], pre11[0] / raw11[0])  # The file's spectral ratio is preserved.
     assert torch.equal(rawf[1:], raw11[1:]) and torch.equal(pref[1:], pre11[1:])
     l4 = train_param.compute_batch_loss(pred, y, 0.85, "esr_dual", 0, None, pref[:2], rawf[:2])
     assert l3.item() > 20 and l4.item() < 0.2, (l3.item(), l4.item())
-    # definizione loss
+    # Loss definition.
     assert train_param.loss_definition("esr_dual", 30.0) == train_param.LOSS_DEF_V4
     assert train_param.loss_definition("esr_dual") == train_param.LOSS_DEF_V3
     try:
@@ -219,7 +219,7 @@ def test_warm_start_expand_equivalence():
     assert worst < 1e-6, worst
     for proj in dst.knob_projections:
         assert proj.scale.weight[:, 2:].abs().max() == 0 and proj.shift.weight[:, 2:].abs().max() == 0
-    # ordine diverso nella destinazione: abbinamento per nome
+    # Match by name when the destination uses a different order.
     dst2 = build_a1_parametric_variant(variant="film_linear", knob_dim=4, knob_names=["mid", "gain", "bass", "treble"])
     expand_knob_warm_start(dst2, src)
     dst2.eval()
@@ -227,7 +227,7 @@ def test_warm_start_expand_equivalence():
         g2 = torch.tensor([[0.7, 0.2]] * 3)
         d = (dst2(x, torch.tensor([[0.4, 0.7, 0.9, 0.2]] * 3), pad_start=False) - src(x, g2, pad_start=False)).abs().max().item()
     assert d < 1e-6, d
-    # errori chiari
+    # Check for clear errors.
     for bad_names, variant in ((["gain", "mid", "bass", "presence"], "film_linear"),
                                (["gain", "treble", "mid", "bass"], "shift_linear")):
         b = build_a1_parametric_variant(variant=variant, knob_dim=4, knob_names=bad_names)
@@ -237,7 +237,7 @@ def test_warm_start_expand_equivalence():
             pass
         else:
             raise AssertionError((bad_names, variant))
-    # stesso controllo passando dal trainer (--init-parametric), passo 0 con LR ~0
+    # Repeat through --init-parametric with an effectively zero learning rate.
     out = _TMP / "warm_main"
     quiet(train_param.main, ["--dataset", str(synthetic_ds()), "--out", str(out), "--variant", "film_linear",
                              "--channels", "16,8", "--steps", "1", "--batch-size", "2", "--segment-samples", "500",
@@ -263,7 +263,7 @@ def _common(out, steps, extra=()):
 
 def test_resume_refusal_and_acceptance():
     fl = ["--energy-floor-db", "30"]
-    # 1) run v3 (exp3) -> riprenderlo con v4 deve essere RIFIUTATO
+    # 1) Reject a V3 training checkpoint when using V4.
     v3 = _TMP / "res_v3"
     quiet(train_param.main, _common(v3, 2))
     assert torch.load(v3 / "train_state.pt", weights_only=False)["args"]["loss_def"] == train_param.LOSS_DEF_V3
@@ -273,18 +273,18 @@ def test_resume_refusal_and_acceptance():
         assert "loss" in str(e)
     else:
         raise AssertionError("v3 train_state resumed with v4 loss")
-    # 2) v4 interrotto e ripreso == v4 continuo
+    # 2) Resumed V4 training matches uninterrupted training.
     a, b = _TMP / "res_a", _TMP / "res_b"
     quiet(train_param.main, _common(a, 6, fl))
     quiet(train_param.main, _common(b, 4, fl))
-    quiet(train_param.main, _common(b, 6, fl))  # auto-resume da train_state.pt
+    quiet(train_param.main, _common(b, 6, fl))  # Automatically resume from train_state.pt.
     sa = torch.load(a / "train_state.pt", weights_only=False)
     sb = torch.load(b / "train_state.pt", weights_only=False)
     assert sa["step"] == sb["step"] == 6 and sa["args"]["loss_def"] == train_param.LOSS_DEF_V4
     for k in sa["model_state_dict"]:
         assert torch.equal(sa["model_state_dict"][k], sb["model_state_dict"][k]), k
     assert sa["history"] == sb["history"]
-    # 2b) LR separato per FiLM (preset exp4): due gruppi Adam, resume esatto anche così
+    # 2b) Exact resume also works with separate Adam learning rates for FiLM.
     fm = fl + ["--film-lr-mult", "10"]
     fa, fb = _TMP / "res_fa", _TMP / "res_fb"
     quiet(train_param.main, _common(fa, 4, fm))
@@ -295,16 +295,16 @@ def test_resume_refusal_and_acceptance():
     groups = s_fa["opt"]["param_groups"]
     assert len(groups) == 2 and math.isclose(groups[1]["lr"] / groups[0]["lr"], 10.0, rel_tol=1e-9), groups
     n_knob = sum(p.numel() for p in build_a1_parametric_variant(variant="film_linear", knob_dim=4).knob_projections.parameters())
-    assert n_knob == 2160, n_knob  # 9 x 240 canali: U (4 col), W (4 col), b
+    assert n_knob == 2160, n_knob  # 240 channels with nine coefficients each: U (4), W (4), and b (1).
     for k in s_fa["model_state_dict"]:
         assert torch.equal(s_fa["model_state_dict"][k], s_fb["model_state_dict"][k]), k
-    # 2c) progress.txt leggibile: FINISHED, step, best e suo step, timestamp Europe/Rome
+    # 2c) Progress shows the status, step, best score and step, and Rome timestamp.
     txt = (a / "progress.txt").read_text()
     assert txt.startswith("STATO: FINISHED") and "Step: 6/6 (100.0%)" in txt, txt
     best_step = min(sa["history"], key=lambda h: h["val_esr_floored"])["step"]
     assert f"allo step {best_step}" in txt and "Aggiornato: " in txt and ("CET" in txt or "CEST" in txt), txt
     assert "step/s" in txt and "Ultima validazione (step 6)" in txt, txt
-    # 2d) stesso dataset in un percorso diverso (nuova sessione Colab): ripresa accettata
+    # 2d) Resume with the same dataset at a new path.
     moved = _TMP / "moved_ds"
     if not moved.exists():
         shutil.copytree(synthetic_ds(), moved)
@@ -314,7 +314,7 @@ def test_resume_refusal_and_acceptance():
     with contextlib.redirect_stdout(log):
         train_param.main(args_moved)
     assert "percorso nuovo" in log.getvalue() and "resumed at step=6" in log.getvalue()
-    # 2e) errore durante il run -> progress.txt ERROR con messaggio
+    # 2e) Training errors are reflected in progress.txt.
     e_dir = _TMP / "res_err"
     try:
         quiet(train_param.main, _common(e_dir, 2, fl + ["--init-parametric", str(_TMP / "non_esiste.pt")]))
@@ -324,7 +324,7 @@ def test_resume_refusal_and_acceptance():
         raise AssertionError("missing init must fail")
     etxt = (e_dir / "progress.txt").read_text()
     assert etxt.startswith("STATO: ERROR") and "non_esiste.pt" in etxt, etxt
-    # 3) cambiare il pavimento o il moltiplicatore LR in resume -> rifiutato
+    # 3) Reject changes to the energy floor or learning rate multiplier during resume.
     for change in (["--energy-floor-db", "20"], fl + ["--film-lr-mult", "5"]):
         try:
             quiet(train_param.main, _common(b, 8, change))
@@ -332,7 +332,7 @@ def test_resume_refusal_and_acceptance():
             assert "incompatible" in str(e) or "loss" in str(e)
         else:
             raise AssertionError(change)
-    # 4) checkpoint troncato (disconnessione durante la scrittura) -> usa train_state.prev.pt
+    # 4) Recover from train_state.prev.pt if the main checkpoint is truncated.
     c = _TMP / "res_c"
     quiet(train_param.main, _common(c, 4, fl))
     assert (c / "train_state.prev.pt").exists()
@@ -341,14 +341,14 @@ def test_resume_refusal_and_acceptance():
     with contextlib.redirect_stdout(log):
         train_param.main(_common(c, 6, fl))
     assert "precedente" in log.getvalue() and torch.load(c / "train_state.pt", weights_only=False)["step"] == 6
-    # 5) i soli pesi di un best v3 sono un warm-start valido per v4
+    # 5) V3 best weights can warm-start a fresh V4 run.
     w = _TMP / "res_warm"
     quiet(train_param.main, _common(w, 2, fl + ["--init-parametric", str(v3 / "best.pt")]))
     rep = json.loads((w / "report.json").read_text())
     assert rep["loss_def"] == train_param.LOSS_DEF_V4 and rep["init_parametric"].endswith("best.pt")
-    # report exp4
+    # Exp4 report.
     assert len(rep["validation_per_file_esr"]) == 81 and len(rep["per_file_esr"]) == 8
-    # nel toy amp, come nel tone stack reale, con treble=mid=bass=0 l'uscita quasi sparisce
+    # The synthetic amp, like a real tone stack, is nearly silent with treble, mid, and bass at zero.
     assert rep["floored_train_files"] == [f"train/gain{g}_treble0.00_mid0.00_bass0.00.wav"
                                           for g in ("0.00", "0.50", "1.00")], rep["floored_train_files"]
     assert set(rep["val_knob_marginals"]) == {"gain", "treble", "mid", "bass"}
@@ -390,7 +390,7 @@ def test_colab_checks():
         m["train"] = m["train"][:25]
         (d / "manifest.json").write_text(json.dumps(m))
     assert "attesi 81" in broken("count", two_knob)
-    # dataset annidato / nome sbagliato / zip caricato al posto della cartella
+    # Nested dataset, wrong folder name, or ZIP uploaded in place of a folder.
     nested = work / "nested" / "dataset_4knob"
     shutil.copytree(ds, nested / "dataset_4knob")
     try:
@@ -403,7 +403,7 @@ def test_colab_checks():
         quiet(colab_checks.verify_dataset, work / "nowhere" / "dataset_4knob")
     except colab_checks.ControlloFallito as e:
         assert "non esiste" in str(e)
-    # _cal e doppioni Drive: solo avvisi
+    # Warn about _cal files and Drive duplicates.
     d = work / "warn" / "dataset_4knob"
     shutil.copytree(ds, d)
     (d / "_cal").mkdir()
@@ -411,19 +411,19 @@ def test_colab_checks():
     shutil.copy(d / t, d / "train" / (Path(t).stem + " (1).wav"))
     info = quiet(colab_checks.verify_dataset, d)
     assert any("_cal" in w for w in info["warnings"]) and any("(1)" in w for w in info["warnings"])
-    # input.wav accanto al dataset (in ParametricNAM/) va bene
+    # Accept input.wav next to the dataset in ParametricNAM/.
     d2 = work / "alt" / "dataset_4knob"
     shutil.copytree(ds, d2)
     shutil.move(str(d2 / "input.wav"), str(d2.parent / "input.wav"))
     assert quiet(colab_checks.verify_dataset, d2, drive_root=d2.parent)["input"] == d2.parent / "input.wav"
-    # hash input sbagliato
+    # Incorrect input hash.
     try:
         quiet(colab_checks.verify_dataset, ds, input_sha256="0" * 64)
     except colab_checks.ControlloFallito as e:
         assert "hash" in str(e)
     else:
         raise AssertionError("input hash")
-    # copia locale + SHA256, poi corruzione rilevata
+    # Verify a local copy with SHA-256 and detect later corruption.
     sums = {rel: colab_checks.sha256(ds / rel) for rel in ["input.wav", t]}
     loc = work / "local" / "dataset_4knob"
     quiet(colab_checks.copy_dataset_local, ds, loc, sums=sums)
@@ -435,7 +435,7 @@ def test_colab_checks():
         assert "SHA256" in str(e) and not (loc / t).exists()
     else:
         raise AssertionError("sha")
-    # zip del codice
+    # Code ZIP archive.
     zdir = work / "zip"
     zdir.mkdir()
     import zipfile

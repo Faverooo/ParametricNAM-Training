@@ -73,6 +73,7 @@ def main():
     print("Loading training dependencies.", flush=True)
     from export_pnam import export, suggested_output_trim
     from nam_param.dataset import read_knob_names
+    from train_param import train_state_exists
 
     args.out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="pnam-data-", dir=args.scratch) as stage:
@@ -98,9 +99,12 @@ def main():
         run_config = args.out / "run_config.json"
         if run_config.exists() and json.loads(run_config.read_text(encoding="utf-8")) != signature:
             parser.error("This output directory belongs to a different configuration or manifest")
-        if not run_config.exists() and (args.out / "train_state.pt").exists():
-            parser.error("Use a new output directory for a run without run_config.json")
-        run_config.write_text(json.dumps(signature, indent=2) + "\n", encoding="utf-8")
+        if not run_config.exists():
+            if train_state_exists(args.out / "train_state.pt"):
+                parser.error("Use a new output directory for a run without run_config.json")
+            temporary = run_config.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(signature, indent=2) + "\n", encoding="utf-8")
+            temporary.replace(run_config)
 
         print(f"Starting training on {args.device} for {args.steps} total steps.", flush=True)
         trainer = Path(__file__).with_name("train_param.py")

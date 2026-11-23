@@ -1,7 +1,7 @@
-"""Controlli PRIMA del training su Colab (solo libreria standard: gira prima di pip install).
+"""Run Colab preflight checks before installing dependencies.
 
-Ogni problema produce un messaggio in italiano con la causa probabile e cosa fare.
-Usato dal notebook ParametricNAM_Colab_exp4.ipynb e dai test (tests/test_exp4.py).
+Checks use the standard library and report likely causes and remedies in Italian.
+Used by the Colab notebook and tests/test_exp4.py.
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ _TOKEN = re.compile(r"^([A-Za-z][A-Za-z]*?)(-?\d+(?:\.\d+)?)$")
 
 
 class ControlloFallito(RuntimeError):
-    """Errore leggibile: il notebook lo mostra e si ferma prima del training."""
+    """A readable error that the notebook shows before stopping training."""
 
 
 def _fail(problems, title):
@@ -63,7 +63,7 @@ def read_sums(path):
 
 
 def find_code_zip(drive_root, name):
-    """Trova lo zip del codice e controlla che sia la versione exp4."""
+    """Find the code ZIP archive and verify that it contains the exp4 trainer."""
     drive_root = Path(drive_root)
     zp = drive_root / name
     stem = Path(name).stem
@@ -97,9 +97,10 @@ def find_code_zip(drive_root, name):
 
 def verify_dataset(dataset_dir, expected_train=81, expected_test=8, expected_knobs=("gain", "treble", "mid", "bass"),
                    input_sha256=None, drive_root=None, sample_rate=48000, sampwidth=3, quiet=False):
-    """Controlla cartella, manifest, input.wav e tutti i WAV (header e dimensione). Non legge l'audio.
+    """Validate the dataset directory, manifest, input.wav, and all WAV headers and sizes.
 
-    :return: dict con percorsi e conteggi; solleva ControlloFallito con TUTTI i problemi trovati.
+    Return the paths and counts, or raise ControlloFallito with all detected issues.
+    Audio samples are not decoded.
     """
     ds = Path(dataset_dir)
     problems, warnings_ = [], []
@@ -144,7 +145,7 @@ def verify_dataset(dataset_dir, expected_train=81, expected_test=8, expected_kno
         if len(e["g"]) != len(expected_knobs) or any(abs(a - b) > 1e-3 for a, b in zip(e["g"], (v for _, v in parsed))):
             problems.append(f"g={e['g']} non corrisponde al nome {e['y']}: manifest modificato a mano?")
             break
-    # input.wav: dentro il dataset (come sul PC) oppure accanto, nella cartella ParametricNAM.
+    # input.wav can be inside the dataset or alongside it in the ParametricNAM folder.
     x_name = manifest.get("x", "input.wav")
     cands = [ds / x_name] + ([Path(drive_root) / x_name] if drive_root else []) + [ds.parent / x_name]
     x_path = next((c for c in cands if c.exists()), None)
@@ -216,10 +217,10 @@ def verify_dataset(dataset_dir, expected_train=81, expected_test=8, expected_kno
 
 
 def copy_dataset_local(src, dst, input_path=None, sums=None):
-    """Copia manifest, input.wav e i soli WAV del manifest su disco locale Colab.
+    """Copy the manifest and its WAV files to Colab's local disk.
 
-    Salta i file già copiati con la stessa dimensione (rilancio nella stessa sessione).
-    Con ``sums`` verifica gli SHA256 dopo la copia (Drive a volte serve file troncati).
+    Skip files that were already copied with the same size. If sums is provided,
+    verify SHA-256 after copying to catch truncated downloads from Drive.
     """
     src, dst = Path(src), Path(dst)
     manifest = json.loads((src / "manifest.json").read_text())
@@ -256,7 +257,7 @@ def copy_dataset_local(src, dst, input_path=None, sums=None):
             for rel in bad:
                 q = dst / rel.split(" ")[0]
                 if q.exists():
-                    q.unlink()  # così il prossimo tentativo lo ricopia
+                    q.unlink()  # Let the next attempt copy it again.
             _fail([f"{len(bad)} file con SHA256 diverso dal PC: {bad[:5]}. Sono corrotti o diversi su Drive: "
                    "ricaricali dal PC (cartella dataset_4knob), poi rilancia. Se hai rigenerato il dataset di "
                    "proposito, imposta VERIFY_SHA256 = False."], "DATASET DIVERSO DA QUELLO DEL PC")

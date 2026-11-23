@@ -229,7 +229,7 @@ class ParametricWaveNet(nn.Module):
         pt_path = path if path.suffix == ".pt" else Path(str(path) + ".pt")
         payload = {"config": cfg, "state_dict": self.state_dict(),
                    "base_nam": self.base._get_export_dict()}
-        # File temporanei nella stessa cartella: riduce checkpoint troncati.
+        # Write temporary files in the same directory before replacing the checkpoints.
         tmp_json = json_path.with_name(json_path.name + ".tmp")
         tmp_pt = pt_path.with_name(pt_path.name + ".tmp")
         with open(tmp_json, "w") as f:
@@ -268,7 +268,7 @@ class ParametricWaveNet(nn.Module):
         self.base.load_state_dict(base_sd, strict=True)
         # Ensure knob projections remain zero
         for proj in self.knob_projections:
-            # MLP: azzera solo l'uscita, non lo strato nascosto (altrimenti morto).
+            # Zero only the MLP output layer so the hidden layer can still learn.
             output = proj.net[-1] if hasattr(proj, "net") else proj
             for param in output.parameters():
                 nn.init.zeros_(param)

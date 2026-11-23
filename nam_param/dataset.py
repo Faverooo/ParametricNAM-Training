@@ -29,6 +29,13 @@ V3_VALIDATION_START = -432_000
 V3_T_VALIDATE = 432_000
 
 
+def reference_audio_path(dataset_dir: Path, manifest: dict) -> Path:
+    name = manifest.get("x", "input.wav")
+    path = dataset_dir / name
+    fallback = dataset_dir.parent / name
+    return fallback if not path.exists() and fallback.exists() else path
+
+
 def _read_wav_mono_f32(path: Union[str, Path]) -> Tuple[np.ndarray, int]:
     path = Path(path)
     try:
@@ -39,7 +46,7 @@ def _read_wav_mono_f32(path: Union[str, Path]) -> Tuple[np.ndarray, int]:
             n = w.getnframes()
             raw = w.readframes(n)
     except wave.Error:
-        # wave legge PCM, non IEEE float: niente euristiche sui bit di un int32.
+        # The wave module reads PCM. Interpret int32 samples as integers.
         from scipy.io import wavfile
         sr, audio = wavfile.read(path)
         if audio.ndim != 1 or not audio.size or audio.dtype.kind not in ("f", "i"):
@@ -92,9 +99,11 @@ _COND_TOKEN = re.compile(r"^([A-Za-z][A-Za-z]*?)(-?\d+(?:\.\d+)?)$")
 
 
 def parse_condition_name(name: Union[str, Path]):
-    """'train/gain0.00_treble0.50_mid1.00_bass0.50.wav' -> (['gain','treble','mid','bass'], [0,0.5,1,0.5]).
+    """Parse knob names and values from a condition filename.
 
-    Solleva ValueError se il nome non è nel formato nome+valore separati da '_'.
+    For example, train/gain0.00_treble0.50_mid1.00_bass0.50.wav yields names
+    gain, treble, mid, and bass and values 0, 0.5, 1, and 0.5.
+    Raise ValueError if the underscore-separated name/value format is invalid.
     """
     stem = Path(str(name).replace("\\", "/")).stem
     names, values = [], []
@@ -110,12 +119,11 @@ def parse_condition_name(name: Union[str, Path]):
 
 
 def infer_knob_names(manifest: dict, atol: float = 1e-3) -> List[str]:
-    """Ordine dei knob in g: manifest['knob_names'] se presente, altrimenti dai nomi file.
+    """Read knob order from manifest['knob_names'] or infer it from filenames.
 
-    Ogni entry train/test deve avere gli stessi nomi nello stesso ordine e valori
-    uguali a g (entro atol): così un manifest scritto a mano o rinominato male si
-    ferma qui invece di allenare con le manopole scambiate.
-    Dataset legacy a 2 knob senza nomi leggibili: ['gain', 'treble'].
+    Train and test entries must agree on knob names and order. Filename values
+    must match g within atol. Legacy two-knob datasets can use gain and treble
+    when filenames lack knob names.
     """
     explicit = manifest.get("knob_names")
     entries = list(manifest.get("train", [])) + list(manifest.get("test", []))
@@ -193,8 +201,8 @@ class ParametricNAMDataset(Dataset):
         if len(set(self.knob_names)) != len(self.knob_names) or not self.knob_names:
             raise ValueError("Invalid manifest knob_names")
         self.balanced = bool(balanced)
-        # Se True i crop restituiscono anche l'indice del file (condizione):
-        # serve al trainer per la loss normalizzata sull'energia del file.
+        # When enabled, crops also return the file index for the condition.
+        # The trainer uses it to normalize the loss by file energy.
         self.return_file_index = bool(return_file_index)
         self._rr_counter = 0
 
@@ -220,11 +228,7 @@ class ParametricNAMDataset(Dataset):
                 )
             self.entries = filtered
 
-        x_name = self.manifest.get("x", "input.wav")
-        x_path = self.dataset_dir / x_name
-        if not x_path.exists():
-            alt = self.dataset_dir.parent / x_name
-            x_path = alt if alt.exists() else x_path
+        x_path = reference_audio_path(self.dataset_dir, self.manifest)
         self.x_full, sr_x = _read_wav_mono_f32(x_path)
         if sr_x != self.sr:
             raise ValueError(f"input.wav sr {sr_x} != manifest {self.sr}")
@@ -297,7 +301,7 @@ class ParametricNAMDataset(Dataset):
             g = torch.from_numpy(self.g_list[file_i].copy())
             return x, y, g
 
-        # Worker diversi non devono ereditare lo stesso stream NumPy via fork.
+        # Give forked workers independent NumPy random streams.
         worker = torch.utils.data.get_worker_info()
         if worker is not None and self._worker_seed != worker.seed:
             self.rng = np.random.default_rng(worker.seed)
@@ -315,8 +319,8 @@ class ParametricNAMDataset(Dataset):
         else:
             start = int(self.rng.integers(self.region_start, max_start + 1))
         stop = start + self.segment_samples
-        # Il target inizia a start; x contiene anche RF-1 campioni di passato.
-        # Il trainer usa pad_start=False: niente falsi transitori a ogni crop.
+        # The target starts at start. The input includes RF-1 preceding samples.
+        # The trainer disables start padding to avoid artificial crop transients.
         ctx = self.receptive_field - 1
         left = max(0, start - ctx)
         x_np = self.input_for(file_i)[left:stop].copy()

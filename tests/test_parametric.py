@@ -174,8 +174,8 @@ def test_validation_protocol():
     assert len(rows) == len(train.entries)
     assert e1 == sum(r["esr_val_region"] for r in rows) / len(rows)
     assert all(r["start_sample"] == train.region_stop for r in rows)
-    # Il vecchio helper a crop deve rispettare pre-roll e pesi per elemento,
-    # anche quando l'ultimo batch ha dimensione diversa.
+    # The crop helper must respect pre-roll and per-item weights,
+    # including when the final batch has a different size.
     from train_param import evaluate
     from torch.utils.data import DataLoader
     a = ParametricNAMDataset(ds_path, split="val", segment_samples=1000,
@@ -356,28 +356,28 @@ def test_file_normalized_loss_silent_crop():
     from nam_param.losses_util import file_train_energies, file_normalized_esr
     from nam.models.losses import apply_pre_emphasis_filter
     torch.manual_seed(0)
-    # File "reale": 2 s di segnale, poi 1 s di rumore di fondo a -100 dBFS.
+    # Simulated recording: 2 s of signal followed by 1 s of background noise at -100 dBFS.
     sig=np.concatenate([np.random.default_rng(0).normal(0,.1,96000),
                         np.random.default_rng(1).normal(0,1e-5,48000)]).astype(np.float32)
     E=file_train_energies([sig],0,len(sig),.85)
     loud=torch.from_numpy(sig[:4800]); quiet=torch.from_numpy(sig[100000:104800])
-    y=torch.stack([loud,loud,quiet]); pred=0.01*torch.randn_like(y)   # uscita piccola tipo init
+    y=torch.stack([loud,loud,quiet]); pred=0.01*torch.randn_like(y)   # Small initial output.
     fe=E.repeat(3)
     old=compute_batch_loss(pred,y,.85,"esr_crop",0,None).item()
     new=compute_batch_loss(pred,y,.85,"esr",0,None,file_energy=fe).item()
-    assert old>1e3, old            # v1: l'elemento silenzioso domina (ESR ~1e5)
-    assert new<5, new              # v2: limitata, ~ ESR dei crop forti
-    # Dentro un file = MSE pre-enfatizzato / costante (obiettivo NAM).
+    assert old>1e3, old            # V1: the silent item dominates (ESR around 1e5).
+    assert new<5, new              # V2: bounded and close to the loud crops' ESR.
+    # Within one file, the NAM objective is pre-emphasized MSE divided by a constant.
     mse=(apply_pre_emphasis_filter(pred,.85)-apply_pre_emphasis_filter(y,.85)).pow(2).mean()
     assert torch.allclose(torch.tensor(new),mse/E[0],rtol=1e-4)
-    # Crop = intera regione: coincide con l'ESR pre-enfatizzato del file.
+    # A crop covering the full region matches its pre-emphasized ESR.
     full=torch.from_numpy(sig)[None]; pf=torch.zeros_like(full)
     assert abs(file_normalized_esr(pf,full,E,.85).item()-1.0)<1e-4
-    # Energia nulla o shape errata: errore esplicito, non NaN silenziosi.
+    # Zero energy or invalid shape must raise an explicit error.
     for bad in (torch.zeros(3), torch.ones(2)):
         try: file_normalized_esr(pred,y,bad,.85); raise AssertionError("expected ValueError")
         except ValueError: pass
-    # Il dataset restituisce l'indice file e il trainer rifiuta checkpoint v1.
+    # The dataset returns file indices and the trainer rejects V1 checkpoints.
     ds=ParametricNAMDataset(legacy_dataset(),segment_samples=500,num_segments=9,return_file_index=True)
     x,yy,g,fi=ds[4]; assert fi==4%len(ds.y_list) and len(yy)==500 and len(x)==500+ds.receptive_field-1
     with tempfile.TemporaryDirectory() as tmp:
@@ -387,7 +387,7 @@ def test_file_normalized_loss_silent_crop():
         with contextlib.redirect_stdout(io.StringIO()): main(common+["--steps","2"])
         st=torch.load(Path(tmp)/"train_state.pt",weights_only=False)
         assert st["args"]["loss_def"]==LOSS_DEF
-        st["args"].pop("loss_def"); torch.save(st,Path(tmp)/"train_state.pt")   # simula checkpoint vecchio
+        st["args"].pop("loss_def"); torch.save(st,Path(tmp)/"train_state.pt")   # Simulate a legacy checkpoint.
         try:
             with contextlib.redirect_stdout(io.StringIO()): main(common+["--steps","4"])
             raise AssertionError("legacy checkpoint must not resume")
@@ -438,8 +438,8 @@ def test_balanced_sampler_and_exact_resume():
             assert torch.equal(a["model_state_dict"][k],b["model_state_dict"][k]),k
         for k,v in a["opt"]["state"].items():
             for name,t in v.items(): assert torch.equal(t,b["opt"]["state"][k][name])
-        # Checkpoint già scritto allo step finale, poi val forzata: aggiornare
-        # anche history/best nel train_state, non lasciarli alla versione vecchia.
+        # Forced validation at the final step must update the checkpoint even if
+        # a periodic save has already run at that step.
         final=Path(tmp)/"final"
         with contextlib.redirect_stdout(io.StringIO()):
             result=main(common+["--out",str(final),"--steps","3","--val-every","4"])
@@ -447,7 +447,95 @@ def test_balanced_sampler_and_exact_resume():
         assert state["best_val"]==result["best_val_esr"]
         assert state["history"][-1]["step"]==3
 
+        resumed = Path(tmp) / "resumed"
+        with contextlib.redirect_stdout(io.StringIO()):
+            resumed_result = main(common + [
+                "--out", str(resumed), "--resume", str(final), "--steps", "3", "--val-every", "4",
+            ])
+        assert resumed_result["steps_this_run"] == 0
+        assert resumed_result["mean_val_esr"] == result["mean_val_esr"]
+        assert (resumed / "train_state.pt").is_file()
+        for name in ("best.pt", "best.json"):
+            assert (resumed / name).read_bytes() == (final / name).read_bytes()
+
+        checkpoint = resumed / "train_state.pt"
+        older = torch.load(checkpoint, weights_only=False)
+        older["best_val"] += 1.0
+        torch.save(older, train_param.previous_state_path(checkpoint))
+        checkpoint.unlink()
+        with contextlib.redirect_stdout(io.StringIO()):
+            recovered = main(common + ["--out", str(resumed), "--steps", "3", "--val-every", "4"])
+        assert recovered["steps_this_run"] == 0
+        assert recovered["best_val_esr"] == result["best_val_esr"]
+        assert recovered["best_step"] == result["best_step"]
+        assert checkpoint.is_file()
+
+        unvalidated = torch.load(checkpoint, weights_only=False)
+        unvalidated["args"]["run_id"] = "new-run"
+        unvalidated["best_val"] = float("inf")
+        unvalidated["history"] = []
+        torch.save(unvalidated, checkpoint)
+        with contextlib.redirect_stdout(io.StringIO()):
+            main(common + ["--out", str(resumed), "--steps", "3", "--val-every", "4"])
+        best = torch.load(resumed / "best.pt", weights_only=False)
+        assert best["config"]["metadata"]["run_id"] == "new-run"
+
     print("balanced blocks + exact CPU resume across epoch boundary: weights/Adam/scheduler/best identical: OK")
+
+
+def test_resume_rejects_changed_dataset_at_same_path(tmp_path):
+    import shutil
+    import pytest
+    from train_param import main
+
+    dataset = tmp_path / "dataset"
+    shutil.copytree(legacy_dataset(), dataset)
+    args = [
+        "--dataset", str(dataset), "--out", str(tmp_path / "run"), "--steps", "1",
+        "--device", "cpu", "--channels", "2,1", "--batch-size", "1", "--segment-samples", "1000",
+    ]
+    main(args)
+    audio = dataset / "input.wav"
+    original_audio = audio.read_bytes()
+    audio.write_bytes(original_audio + b"\0")
+    with pytest.raises(ValueError, match="WAV content changed"):
+        main(args)
+    audio.write_bytes(original_audio)
+    manifest = dataset / "manifest.json"
+    manifest.write_text(manifest.read_text() + "\n")
+    with pytest.raises(ValueError, match="Resume incompatible option dataset"):
+        main(args)
+
+
+def test_completed_epoch_resume_writes_checkpoint(tmp_path):
+    from train_param import main
+
+    run = tmp_path / "run"
+    resumed = tmp_path / "resumed"
+    args = [
+        "--dataset", str(legacy_dataset()), "--epochs", "1", "--segments-per-epoch", "1",
+        "--device", "cpu", "--channels", "2,1", "--batch-size", "1", "--segment-samples", "1000",
+        "--loss", "esr_dual", "--energy-floor-db", "30",
+    ]
+    original = main(args + ["--out", str(run)])
+    result = main(args + ["--resume", str(run), "--out", str(resumed)])
+    assert result["steps_this_run"] == 0
+    assert result["best_val_esr"] == original["mean_val_esr_floored"]
+    assert (resumed / "train_state.pt").is_file()
+    assert (resumed / "last.pt").is_file()
+
+
+def test_early_stop_uses_default_step_budget(tmp_path):
+    from unittest.mock import patch
+    import train_param
+
+    with patch.object(train_param, "_main") as train:
+        train_param.main(["--dataset", "unused", "--out", str(tmp_path), "--early-stop-steps", "100"])
+
+    args, _, progress = train.call_args.args
+    assert args.steps == 50000
+    assert args.early_stop_steps == 100
+    assert progress.f["total"] == args.steps
 
 
 def test_v3_loss_and_dc_contracts():

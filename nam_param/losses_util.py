@@ -66,7 +66,7 @@ def mse_loss(pred: torch.Tensor, target: torch.Tensor, pre_emph_coef: float | No
 
 
 def esr_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """NAM ESR: media dei rapporti per elemento del batch (non rapporto globale)."""
+    """Compute NAM ESR as the mean of per-item energy ratios."""
     return esr(pred, target)
 
 
@@ -134,20 +134,16 @@ def file_train_energies(y_list, start: int, stop: int, pre_emph_coef: float | No
 
 
 def floor_file_energies(table: torch.Tensor, floor_db_below_median: float | None):
-    """Loss v4: normalizzatore per file = max(E_file, mediana(E) * 10^(-floor_db/10)).
+    """Floor per-file energy at median(E) * 10**(-floor_db / 10).
 
-    Perché: con la normalizzazione per file (v2/v3) un file quasi muto pesa come
-    gli altri, ma il suo denominatore è piccolissimo. Nel dataset a 4 knob il file
-    con treble/mid/bass a 0 ha RMS -88,7 dBFS, circa 59 dB sotto la mediana
-    (-29,6 dBFS): un offset DC del modello a -70 dBFS, innocuo altrove, lì varrebbe
-    ESR ~ 70 e dominerebbe gradiente e scelta del best. Con soglia = mediana - 30 dB
-    (= -59,6 dBFS sul dataset reale) vengono "pavimentati" solo i 3 file sotto
-    -60 dBFS; il successivo (-53,5 dBFS) resta normalizzato su se stesso.
-    Il pavimento è RELATIVO alla mediana del dataset, quindi non dipende dal
-    livello di uscita scelto in calibrazione. Calcolato separatamente per la
-    tabella pre-enfatizzata e per quella raw.
+    Per-file normalization can let nearly silent files dominate the objective.
+    In the four-knob dataset, the quietest setting is about 59 dB below the median,
+    so even a -70 dBFS model offset can yield an ESR of about 70. A floor 30 dB below
+    the median affects only the three recordings below about -60 dBFS. Because it is
+    relative to the median, the floor is independent of calibration gain. Compute
+    it separately for raw and pre-emphasized tables when calling this function.
 
-    :return: (tabella pavimentata, valore floor, indici dei file pavimentati)
+    Return the floored table, floor value, and indices of the affected files.
     """
     if floor_db_below_median is None:
         return table, None, []
@@ -164,16 +160,13 @@ def floor_file_energies(table: torch.Tensor, floor_db_below_median: float | None
 
 
 def floor_file_energies_paired(raw_table: torch.Tensor, pre_table: torch.Tensor, floor_db_below_median: float | None):
-    """Loss v4 usata dal trainer: la decisione "file troppo basso" si prende sul LIVELLO raw.
+    """Floor per-file raw energy relative to its median for the V4 training loss.
 
-    floor = mediana(E_raw) * 10^(-dB/10). Per ogni file con E_raw < floor si alza
-    di uno stesso fattore f = floor / E_raw sia E_raw sia E_pre: così il file conta
-    come se fosse a quel livello, ma il rapporto fra termine pre-enfatizzato e raw
-    (cioè il suo spettro) resta quello vero. Un pavimento separato sulla tabella
-    pre-enfatizzata colpirebbe anche file normali ma scuri (treble 0, bass 1), che
-    hanno poca energia in alta frequenza: non è quello che vogliamo.
+    For raw energy below the floor, multiply raw and pre-emphasized energy by
+    the same factor, floor / E_raw. This preserves their ratio and avoids flooring
+    a file solely because it has little high-frequency energy.
 
-    :return: (raw_floored, pre_floored, floor_raw, indici pavimentati)
+    Return the floored raw and pre-emphasized tables, raw floor, and affected indices.
     """
     raw_f, floor, idx = floor_file_energies(raw_table, floor_db_below_median)
     if floor is None:

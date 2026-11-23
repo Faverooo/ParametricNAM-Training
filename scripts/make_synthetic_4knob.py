@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Dataset sintetico a 4 knob con la STESSA struttura di dataset_4knob (per test/smoke).
+"""Generate a four-knob test dataset with the same layout as dataset_4knob.
 
-81 train (griglia {0,0.5,1}^4) + 8 test fuori griglia, nomi
-train/gain0.00_treble0.50_mid1.00_bass0.50.wav, manifest.json senza knob_names
-(come quello reale), input.wav dentro la cartella, 48 kHz mono 24 bit.
-Il target è un "amp" giocattolo: drive tanh(gain) -> tone stack (bass/mid/treble
-come pesi di tre bande) -> livello. Con treble=mid=bass=0 l'uscita è ~60 dB più
-bassa, come nel tone stack Fender reale (serve a provare il pavimento della loss).
+The 48 kHz mono 24-bit dataset has 81 training points on the {0, 0.5, 1} grid
+and eight off-grid test points. Filenames encode knobs and values. The manifest
+omits knob_names, and input.wav is stored alongside it.
+
+The synthetic amp applies tanh drive and a three-band tone stack, followed by
+a level stage. Setting treble, mid, and bass to zero reduces the output by
+about 60 dB, which exercises the loss denominator floor.
 """
 from __future__ import annotations
 
@@ -39,7 +40,7 @@ def _onepole(x, a):
         pass
     y = np.empty_like(x)
     acc = 0.0
-    for i in range(len(x)):  # lento ma semplice; i test usano file corti
+    for i in range(len(x)):  # Simple implementation for the short test files.
         acc = a * acc + (1 - a) * x[i]
         y[i] = acc
     return y

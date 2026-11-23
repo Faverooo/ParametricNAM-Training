@@ -37,7 +37,7 @@ def clone_parametric(model: ParametricWaveNet) -> ParametricWaveNet:
     """Deep-copy via state_dict round-trip (preserves variant / channels / bias)."""
     from nam.models import init_from_nam
     from .variants import ParametricWaveNetVariant
-    # deepcopy da solo NON basta: le closure forward resterebbero sui vecchi layer.
+    # Rebind forward closures after copying so they refer to the copied layers.
     twin = ParametricWaveNetVariant(
         init_from_nam(model.base._get_export_dict()), knob_dim=model.knob_dim,
         knob_names=model.knob_names, variant=getattr(model, "variant", "shift_linear"),
@@ -51,9 +51,9 @@ def clone_parametric(model: ParametricWaveNet) -> ParametricWaveNet:
 
 
 def fold_knobs_into_conv_bias(model: ParametricWaveNet, g: torch.Tensor) -> ParametricWaveNet:
-    """
-    In-place fold of shift-only conditioning into dilated-conv bias.
-    Nome storico: inoltra anche FiLM a fold_knobs (dispatch).
+    """Fold shift-only conditioning into dilated convolution bias in place.
+
+    This legacy entry point also delegates FiLM to fold_knobs.
     """
     return fold_knobs(model, g)
 
@@ -72,7 +72,7 @@ def fold_knobs(model: ParametricWaveNet, g: torch.Tensor) -> ParametricWaveNet:
         )
     param = next(model.parameters())
     g = g.to(device=param.device, dtype=param.dtype)
-    # Il fold affine semplice non commuta con FiLM audio post-conv/mixer.
+    # Simple affine folding is incompatible with audio FiLM after convolution or mixing.
     if any(layer._conv_post_film is not None or layer._input_mixin_post_film is not None
            for layer in _iter_layers(model.base)):
         raise NotImplementedError("Bake with audio post-conv/mixer FiLM is not supported")
@@ -134,7 +134,7 @@ def _fold_film_layer(layer, g: torch.Tensor) -> None:
             )
         mix.weight.data.mul_(s.view(C, 1, 1))
         if mix.bias is not None:
-            mix.bias.mul_(s)  # t è già contato UNA volta nel bias conv.
+            mix.bias.mul_(s)  # The convolution bias already includes t once.
         # Zero FiLM so s=1, t=0
         film.scale.weight.zero_()
         film.shift.weight.zero_()

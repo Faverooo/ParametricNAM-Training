@@ -1,7 +1,7 @@
-"""progress.txt leggibile dal telefono (app Google Drive): stato del training in chiaro.
+"""Write the training status to progress.txt for viewing in Google Drive.
 
-Sovrascritto (scrittura atomica) ogni N step, a ogni validazione, alla fine e in caso
-di errore. Orari in Europe/Rome.
+Replace it atomically at the configured step interval, on validation,
+on completion, and on error. Timestamps use Europe/Rome.
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from pathlib import Path
 try:
     from zoneinfo import ZoneInfo
     _TZ = ZoneInfo("Europe/Rome")
-except Exception:  # tzdata mancante: ora locale del sistema
+except Exception:  # Use system local time if tzdata is unavailable.
     _TZ = None
 
 
@@ -69,7 +69,7 @@ class ProgressWriter:
             tmp = self.path.with_name(self.path.name + ".tmp")
             tmp.write_text(text, encoding="utf-8")
             os.replace(tmp, self.path)
-        except OSError as e:  # Drive momentaneamente non scrivibile: non fermare il training
+        except OSError as e:  # Continue training if Drive is temporarily unwritable.
             print(f"(progress.txt non scritto: {e})")
         return text
 
